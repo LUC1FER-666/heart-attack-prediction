@@ -1,0 +1,15 @@
+Model,AUC,Accuracy,Precision,Recall,F1,Grade
+Bagging,0.9968,0.9805,0.9791,0.9833,0.981,Excellent
+KNN,0.9958,0.9756,0.9769,0.9762,0.9763,Excellent
+Stacking Ensemble,0.9955,0.9829,0.9836,0.9833,0.9833,Excellent
+Voting Ensemble,0.9954,0.9829,0.9836,0.9833,0.9833,Excellent
+XGBoost,0.9949,0.9829,0.9814,0.9857,0.9834,Excellent
+LightGBM,0.9935,0.9805,0.9835,0.9786,0.9808,Excellent
+SVM,0.9921,0.9585,0.9596,0.9596,0.9595,Excellent
+MLP (DL),0.9908,0.9744,0.9697,0.981,0.9751,Excellent
+Random Forest,0.976,0.9098,0.8798,0.9549,0.9156,Excellent
+Extra Trees,0.9605,0.8902,0.8705,0.924,0.8961,Excellent
+AdaBoost,0.9537,0.8732,0.8559,0.9073,0.8804,Excellent
+Decision Tree,0.9375,0.861,0.8549,0.8815,0.8663,Very Good
+Logistic,0.9346,0.8683,0.8505,0.9025,0.8754,Very Good
+Naive Bayes,0.9011,0.8134,0.8232,0.8193,0.8139,Very Good

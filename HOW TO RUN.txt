@@ -1,0 +1,19 @@
+HOW TO RUN
+
+1. on vs code press ctrl + `
+
+2. cd "the path of the files stored in a folder"
+
+3. run .\venv\Scripts\Activate.ps1
+
+4. you should see (venv) PS C:\Users\aryan\Desktop\New folder>
+
+5. pip install -r requirements.txt
+
+6. python preprocess.py
+
+7. python eda.py
+
+8. python train.py 
+
+9. streamlit run app.py
