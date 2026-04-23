@@ -36,6 +36,8 @@ from sklearn.metrics import (
     roc_curve, auc,
 )
 
+import shap
+
 from preprocess import preprocess
 
 MODELS_DIR = "models"
@@ -132,6 +134,186 @@ def grade(auc_score):
     return "Fair"
 
 
+def _is_native_tree(name):
+    """
+    Models that TreeExplainer handles natively (sklearn RF/ET/DecisionTree,
+    XGBoost, LightGBM).  AdaBoost and Bagging are NOT natively supported —
+    they fall through to KernelExplainer.
+    """
+    native = ["Random Forest", "Extra Trees", "Decision Tree", "XGBoost", "LightGBM"]
+    return any(kw in name for kw in native)
+
+
+def _normalize_shap_values(raw, n_expected_rows):
+    """
+    Normalise SHAP output to a 2-D float array (n_samples, n_features).
+
+    Handles every shape SHAP can return for binary classification:
+      list[2]  — sklearn TreeExplainer  → take [1]  (positive class)
+      list[1]  — rare single-output     → take [0]
+      ndarray (n, f, 2) or (2, n, f)   → slice to positive class
+      ndarray (n, f)                    → already correct
+    Also trims to n_expected_rows so X_sample and shap_values always match.
+    """
+    if isinstance(raw, list):
+        arr = raw[1] if len(raw) == 2 else raw[0]
+    elif isinstance(raw, np.ndarray) and raw.ndim == 3:
+        # could be (n, features, classes) or (classes, n, features)
+        if raw.shape[0] == 2:          # (classes, n, features)
+            arr = raw[1]
+        else:                          # (n, features, classes)
+            arr = raw[:, :, 1]
+    else:
+        arr = raw
+
+    arr = np.array(arr, dtype=float)
+
+    # KernelExplainer explains only [:100] rows but X_sample may be 200 rows
+    # — trim X_sample to match in generate_shap_plots; here trim shap to be safe
+    if arr.shape[0] > n_expected_rows:
+        arr = arr[:n_expected_rows]
+
+    return arr
+
+
+def compute_shap(model, X_train, X_sample, feature_names, model_name):
+    """
+    Compute SHAP values for a fitted model.
+    Returns (explainer, shap_values_2d, X_explained) or (None, None, None).
+    X_explained is the feature matrix that matches shap_values row-for-row.
+    """
+    try:
+        if _is_native_tree(model_name):
+            explainer  = shap.TreeExplainer(model)
+            raw        = explainer.shap_values(X_sample)
+            X_explained = X_sample
+
+        elif "Logistic" in model_name:
+            explainer  = shap.LinearExplainer(model, X_train)
+            raw        = explainer.shap_values(X_sample)
+            X_explained = X_sample
+
+        elif "Naive Bayes" in model_name:
+            # GaussianNB is not supported by LinearExplainer; use Kernel instead
+            background  = shap.sample(X_train, min(50, len(X_train)))
+            explainer   = shap.KernelExplainer(model.predict_proba, background)
+            X_explained = X_sample[:100]
+            raw         = explainer.shap_values(X_explained)
+
+        else:
+            # Fallback for SVM, KNN, MLP, AdaBoost, Bagging, Voting, Stacking
+            background  = shap.sample(X_train, min(50, len(X_train)))
+            explainer   = shap.KernelExplainer(model.predict_proba, background)
+            X_explained = X_sample[:100]
+            raw         = explainer.shap_values(X_explained)
+
+        shap_values = _normalize_shap_values(raw, n_expected_rows=len(X_explained))
+        return explainer, shap_values, X_explained
+
+    except Exception as e:
+        print(f"    [SHAP] Skipped {model_name}: {e}")
+        return None, None, None
+
+
+def _safe_expected_value(explainer):
+    """Return a scalar expected value regardless of explainer type."""
+    ev = explainer.expected_value
+    if isinstance(ev, (list, np.ndarray)):
+        # binary: [neg, pos] → take positive class
+        ev = ev[1] if len(ev) == 2 else ev[0]
+    return float(ev)
+
+
+def generate_shap_plots(explainer, shap_values, X_explained, feature_cols, model_name):
+    """
+    Save three SHAP plots for a model.
+    X_explained must be the exact matrix used to compute shap_values (same rows).
+      shap_<safe>_summary.png  — beeswarm summary
+      shap_<safe>_bar.png      — mean(|SHAP|) bar chart (manually built, version-safe)
+      shap_<safe>_force.png    — force plot for sample[0]
+    """
+    safe = model_name.replace(" ", "_").replace("(", "").replace(")", "")
+    # Ensure correct shape
+    if len(shap_values.shape) != 2:
+        print(f"    [SHAP] Invalid shape for {model_name}: {shap_values.shape}")
+        return
+
+    if shap_values.shape[0] != X_explained.shape[0]:
+        min_rows = min(shap_values.shape[0], X_explained.shape[0])
+        shap_values = shap_values[:min_rows]
+        X_explained = X_explained[:min_rows]
+
+    if shap_values.shape[1] != X_explained.shape[1]:
+        print(f"    [SHAP] Feature mismatch for {model_name}: "
+            f"{shap_values.shape[1]} vs {X_explained.shape[1]}")
+        return
+    # Ensure feature names match processed data
+    if len(feature_cols) != shap_values.shape[1]:
+        feature_cols = [f"Feature_{i}" for i in range(shap_values.shape[1])]
+    # ── Summary (beeswarm) ────────────────────────────────────────────────────
+    try:
+        if shap_values.shape[0] > 1 and shap_values.shape[1] > 0:
+            plt.figure()
+            shap.summary_plot(
+                shap_values,
+                X_explained,
+                feature_names=list(feature_cols),
+                show=False
+            )
+            plt.savefig(f"{FIGURES_DIR}/shap_{safe}_summary.png",
+                        bbox_inches="tight", dpi=100)
+        else:
+            print(f"    [SHAP] Skipped summary_plot for {model_name} (invalid dimensions)")
+        plt.close()
+    except Exception as e:
+        print(f"    [SHAP] summary_plot failed for {model_name}: {e}")
+        plt.close("all")
+    # ── Bar (mean absolute SHAP — manually built, no API version dependency) ──
+    try:
+        sv         = np.array(shap_values, dtype=float)   # (n, features)
+        mean_abs   = np.abs(sv).mean(axis=0)               # (features,)
+        feat_names = list(feature_cols)
+
+        order         = np.argsort(mean_abs)               # ascending → top at top
+        sorted_names  = [feat_names[i] for i in order]
+        sorted_values = mean_abs[order]
+
+        fig, ax = plt.subplots(figsize=(8, max(4, len(feat_names) * 0.45)))
+        bars = ax.barh(sorted_names, sorted_values, color="steelblue")
+        ax.set_xlabel("mean(|SHAP value|)", fontsize=11)
+        ax.set_title(f"{model_name} — SHAP Feature Importance",
+                     fontsize=12, fontweight="bold")
+        for bar, val in zip(bars, sorted_values):
+            ax.text(val + mean_abs.max() * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{val:.4f}", va="center", fontsize=8)
+        plt.tight_layout()
+        fig.savefig(f"{FIGURES_DIR}/shap_{safe}_bar.png",
+                    bbox_inches="tight", dpi=100)
+        plt.close(fig)
+    except Exception as e:
+        print(f"    [SHAP] bar_plot failed for {model_name}: {e}")
+        plt.close("all")
+
+    # ── Force plot (single prediction) ───────────────────────────────────────
+    try:
+        expected_val = _safe_expected_value(explainer)
+        shap.force_plot(
+            expected_val,
+            shap_values[0],
+            X_explained[0],
+            feature_names=list(feature_cols),
+            matplotlib=True,
+            show=False,
+        )
+        plt.savefig(f"{FIGURES_DIR}/shap_{safe}_force.png",
+                    bbox_inches="tight", dpi=100)
+        plt.close()
+    except Exception as e:
+        print(f"    [SHAP] force_plot failed for {model_name}: {e}")
+        plt.close("all")
+
+
 def train_and_evaluate(csv_path: str = "heart.csv"):
     print("\n" + "=" * 70)
     print("            HEART DISEASE — MODEL TRAINING")
@@ -144,6 +326,9 @@ def train_and_evaluate(csv_path: str = "heart.csv"):
 
     all_models = build_models()
     results = []
+
+    # ── SHAP sample: fixed 200-row slice of training data ────────────────────
+    X_sample = X_train_processed[:200]
 
     for name, model in all_models.items():
         print(f"\n  Training: {name}")
@@ -160,6 +345,7 @@ def train_and_evaluate(csv_path: str = "heart.csv"):
 
         safe = name.replace(" ", "_").replace("(", "").replace(")", "")
 
+        # ── Confusion Matrix ──────────────────────────────────────────────────
         cm = confusion_matrix(y_test, y_pred_test)
         fig, ax = plt.subplots(figsize=(5, 4))
         ConfusionMatrixDisplay(cm, display_labels=["No Disease", "Disease"]).plot(ax=ax)
@@ -168,6 +354,7 @@ def train_and_evaluate(csv_path: str = "heart.csv"):
         fig.savefig(f"{FIGURES_DIR}/cm_{safe}.png", dpi=100)
         plt.close(fig)
 
+        # ── ROC Curve ────────────────────────────────────────────────────────
         fpr, tpr, _ = roc_curve(y_test, y_prob_test)
         roc_val = auc(fpr, tpr)
         fig, ax = plt.subplots(figsize=(5, 4))
@@ -182,8 +369,19 @@ def train_and_evaluate(csv_path: str = "heart.csv"):
         fig.savefig(f"{FIGURES_DIR}/roc_{safe}.png", dpi=100)
         plt.close(fig)
 
+        # ── Save model ────────────────────────────────────────────────────────
         with open(f"{MODELS_DIR}/{safe}.pkl", "wb") as f:
             pickle.dump(model, f)
+
+        # ── SHAP Explainability ───────────────────────────────────────────────
+        print(f"   Computing SHAP for: {name} …")
+        explainer, shap_values, X_explained = compute_shap(
+            model, X_train_processed, X_sample, feature_cols, name
+        )
+        if shap_values is not None:
+            generate_shap_plots(explainer, shap_values, X_explained, feature_cols, name)
+            print(f"   SHAP plots saved  → figures/shap_{safe}_{{summary,bar,force}}.png")
+        # ─────────────────────────────────────────────────────────────────────
 
         results.append({
             "Model"    : name,
@@ -205,12 +403,10 @@ def train_and_evaluate(csv_path: str = "heart.csv"):
     print("  Accuracy is secondary and naturally lower on small datasets.")
     print("=" * 70)
 
-    # Pretty print with rank
     display_df = results_df.copy()
     display_df.insert(0, "Rank", display_df.index)
     print(display_df.to_string(index=False))
 
-    # Save results (with AUC first)
     results_df.to_csv(f"{MODELS_DIR}/results.csv", index=False)
 
     # ── AUC Leaderboard chart ─────────────────────────────────────────────────
@@ -237,7 +433,7 @@ def train_and_evaluate(csv_path: str = "heart.csv"):
     fig.savefig(f"{FIGURES_DIR}/model_leaderboard_auc.png", dpi=130)
     plt.close(fig)
 
-    # ── Radar / multi-metric comparison ──────────────────────────────────────
+    # ── Top-5 multi-metric comparison ─────────────────────────────────────────
     top5 = results_df.head(5)
     metrics = ["AUC", "Accuracy", "Precision", "Recall", "F1"]
     fig, axes = plt.subplots(1, len(metrics), figsize=(16, 4), sharey=False)

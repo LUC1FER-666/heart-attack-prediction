@@ -169,6 +169,11 @@ def preprocess(csv_path: str):
     preprocessor = build_preprocessor(num_cols, bin_cols, cat_cols)
     X_train_processed = preprocessor.fit_transform(X_train_df)
     X_test_processed  = preprocessor.transform(X_test_df)
+        # ✅ FIX: get transformed feature names
+    try:
+        feature_cols = preprocessor.get_feature_names_out()
+    except:
+        feature_cols = [f"Feature_{i}" for i in range(X_train_processed.shape[1])]
 
     print(f"  Train : {X_train_processed.shape}")
     print(f"  Test  : {X_test_processed.shape}")
